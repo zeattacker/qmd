@@ -76,6 +76,7 @@ import {
   type ReindexResult,
 } from "../store.js";
 import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, withLLMSession, pullModels, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, DEFAULT_MODEL_CACHE_DIR } from "../llm.js";
+import { createLLM, isRemoteLLMConfigured } from "../llm-remote.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -118,6 +119,13 @@ function getStore(): ReturnType<typeof createStore> {
       syncConfigToDb(store.db, config);
     } catch {
       // Config may not exist yet — that's fine, DB works without it
+    }
+    // Use remote LLM backend if configured (QMD_EMBED_URL / QMD_RERANK_URL)
+    if (isRemoteLLMConfigured()) {
+      store.llm = createLLM({
+        inactivityTimeoutMs: 5 * 60 * 1000,
+        disposeModelsOnInactivity: true,
+      });
     }
   }
   return store;
