@@ -15,17 +15,8 @@ done
 # to avoid native module ABI mismatches (e.g., better-sqlite3 compiled for bun vs node)
 DIR="$(cd -P "$(dirname "$SOURCE")/.." && pwd)"
 
-# Detect the package manager that installed dependencies by checking lockfiles.
-# $BUN_INSTALL is intentionally NOT checked — it only indicates that bun exists
-# on the system, not that it was used to install this package (see #361).
-#
-# package-lock.json takes priority: if it exists, npm installed the native
-# modules for Node.  The repo ships bun.lock, so without this check, source
-# builds that use npm would be incorrectly routed to bun, causing ABI
-# mismatches with better-sqlite3 / sqlite-vec (see #381).
-if [ -f "$DIR/package-lock.json" ]; then
-  exec node "$DIR/dist/cli/qmd.js" "$@"
-elif [ -f "$DIR/bun.lock" ] || [ -f "$DIR/bun.lockb" ]; then
+# Check if we were installed with bun (look for bun.lock or bun-lockb)
+if [ -f "$DIR/bun.lock" ] || [ -f "$DIR/bun.lockb" ] || [ -n "$BUN_INSTALL" ]; then
   exec bun "$DIR/dist/cli/qmd.js" "$@"
 else
   exec node "$DIR/dist/cli/qmd.js" "$@"

@@ -2,12 +2,6 @@
 
 ## [Unreleased]
 
-### Fixes
-
-- Sync stale `bun.lock` (`better-sqlite3` 11.x → 12.x). CI and release
-  script now use `--frozen-lockfile` to prevent recurrence. #386
-  (thanks @Mic92)
-
 ## [2.0.1] - 2026-03-10
 
 ### Changes
