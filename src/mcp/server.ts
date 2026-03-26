@@ -8,12 +8,14 @@
  */
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { execFile, execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "url";
 import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { WebStandardStreamableHTTPServerTransport }
   from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
+import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import {
@@ -512,6 +514,97 @@ Intent-aware lex (C++ performance, not sports):
     }
   );
 
+  // ── Collection management tools ────────────────────────────────────────────
+
+  server.registerTool(
+    "collection_list",
+    {
+      title: "List Collections",
+      description: "List all registered QMD collections with their paths and document counts.",
+      annotations: { readOnlyHint: true, openWorldHint: false },
+      inputSchema: {},
+    },
+    async () => {
+      const cols = await store.listCollections();
+      const rows = cols.map(c => {
+        const excl = c.includeByDefault === false ? " [excluded]" : "";
+        return `  - ${c.name}: ${c.pwd} (${c.doc_count} docs)${excl}`;
+      });
+      const text = cols.length === 0
+        ? "No collections registered."
+        : `Collections (${cols.length}):\n` + rows.join("\n");
+      return { content: [{ type: "text", text }] };
+    }
+  );
+
+  server.registerTool(
+    "collection_add",
+    {
+      title: "Add Collection",
+      description: "Register a new collection directory for indexing. Triggers re-index in background.",
+      annotations: { readOnlyHint: false, openWorldHint: false },
+      inputSchema: {
+        name: z.string().describe("Collection name (slug, no spaces)"),
+        path: z.string().describe("Absolute path inside container"),
+        pattern: z.string().optional().describe("Glob pattern (default: **/*.md)"),
+      },
+    },
+    async ({ name, path: colPath, pattern }) => {
+      await store.addCollection(name, { path: colPath, pattern: pattern ?? "**/*.md" });
+      execFile("node", ["/app/dist/cli/qmd.js", "update"], { env: process.env }, () => {});
+      return {
+        content: [{ type: "text", text: `Collection '${name}' registered at ${colPath}. Re-index triggered.` }],
+      };
+    }
+  );
+
+  server.registerTool(
+    "collection_remove",
+    {
+      title: "Remove Collection",
+      description: "Unregister a collection (files on disk NOT deleted).",
+      annotations: { readOnlyHint: false, openWorldHint: false },
+      inputSchema: {
+        name: z.string().describe("Collection name to remove"),
+      },
+    },
+    async ({ name }) => {
+      const ok = await store.removeCollection(name);
+      if (!ok) return { content: [{ type: "text", text: `Collection '${name}' not found.` }], isError: true };
+      return { content: [{ type: "text", text: `Collection '${name}' removed from index.` }] };
+    }
+  );
+
+  server.registerTool(
+    "collection_update",
+    {
+      title: "Re-index Collections",
+      description: "Trigger re-indexing of all collections. Runs in background.",
+      annotations: { readOnlyHint: false, openWorldHint: false },
+      inputSchema: {},
+    },
+    async () => {
+      execFile("node", ["/app/dist/cli/qmd.js", "update"], { env: process.env }, () => {});
+      return { content: [{ type: "text", text: "Re-index triggered in background." }] };
+    }
+  );
+
+  server.registerTool(
+    "collection_embed",
+    {
+      title: "Generate Embeddings",
+      description: "Generate vector embeddings for documents that need them. Runs in background.",
+      annotations: { readOnlyHint: false, openWorldHint: false },
+      inputSchema: {},
+    },
+    async () => {
+      execFile("node", ["/app/dist/cli/qmd.js", "embed"], { env: process.env }, () => {});
+      return { content: [{ type: "text", text: "Embedding generation triggered in background." }] };
+    }
+  );
+
+  // ───────────────────────────────────────────────────────────────────────────
+
   return server;
 }
 
@@ -573,6 +666,7 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
 
   const startTime = Date.now();
   const quiet = options?.quiet ?? false;
+  const sseSessions = new Map<string, SSEServerTransport>();
 
   /** Format timestamp for request logging */
   function ts(): string {
@@ -674,6 +768,220 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
         return;
       }
 
+      // ── SSE transport (MCP 2024-11-05) — mcporter & older client compatibility ──
+      if (pathname === "/mcp" && nodeReq.method === "GET" && nodeReq.headers["accept"]?.includes("text/event-stream")) {
+        const sseTransport = new SSEServerTransport("/messages", nodeRes);
+        sseSessions.set(sseTransport.sessionId, sseTransport);
+        nodeRes.on("close", () => {
+          sseSessions.delete(sseTransport.sessionId);
+          log(`${ts()} SSE session closed: ${sseTransport.sessionId}`);
+        });
+        const sseServer = await createMcpServer(store);
+        await sseServer.connect(sseTransport);
+        log(`${ts()} GET /mcp SSE session: ${sseTransport.sessionId}`);
+        return;
+      }
+
+      // SSE message POST (client→server for SSE sessions)
+      const reqParsed = new URL(nodeReq.url!, "http://localhost");
+      if (reqParsed.pathname === "/messages" && nodeReq.method === "POST") {
+        const sessionId = reqParsed.searchParams.get("sessionId") ?? "";
+        const sseTransport = sseSessions.get(sessionId);
+        if (!sseTransport) {
+          nodeRes.writeHead(400, { "Content-Type": "application/json" });
+          nodeRes.end(JSON.stringify({ error: `SSE session not found: ${sessionId}` }));
+          return;
+        }
+        const rawBody = await collectBody(nodeReq);
+        const body = JSON.parse(rawBody);
+        await sseTransport.handlePostMessage(nodeReq as any, nodeRes as any, body);
+        log(`${ts()} POST /messages session: ${sessionId}`);
+        return;
+      }
+
+      // ── REST: POST /get — retrieve full document content from index ──
+      if (pathname === "/get" && nodeReq.method === "POST") {
+        const rawBody = await collectBody(nodeReq);
+        let fileParam = "";
+        try { fileParam = JSON.parse(rawBody).file ?? ""; } catch {}
+        if (!fileParam) {
+          nodeRes.writeHead(400, { "Content-Type": "application/json" });
+          nodeRes.end(JSON.stringify({ error: "Missing file in JSON body" }));
+          return;
+        }
+        const result = await store.get(fileParam, { includeBody: false });
+        if ("error" in result) {
+          nodeRes.writeHead(404, { "Content-Type": "application/json" });
+          nodeRes.end(JSON.stringify({ error: "Document not found", file: fileParam, similar: result.similarFiles?.slice(0, 5) }));
+          log(`${ts()} POST /get 404 file=${fileParam} (${Date.now() - reqStart}ms)`);
+          return;
+        }
+        const body = await store.getDocumentBody(result.filepath) ?? "";
+        nodeRes.writeHead(200, { "Content-Type": "text/markdown; charset=utf-8" });
+        nodeRes.end(body);
+        log(`${ts()} POST /get file=${fileParam} (${body.length}c, ${Date.now() - reqStart}ms)`);
+        return;
+      }
+
+      // ── REST: GET /get?file=<path> — same as POST but via query string ──
+      if (pathname.startsWith("/get") && nodeReq.method === "GET") {
+        const fileParam = new URL(nodeReq.url!, "http://localhost").searchParams.get("file") ?? "";
+        if (!fileParam) {
+          nodeRes.writeHead(400, { "Content-Type": "application/json" });
+          nodeRes.end(JSON.stringify({ error: "Missing ?file= parameter" }));
+          return;
+        }
+        const result = await store.get(fileParam, { includeBody: false });
+        if ("error" in result) {
+          nodeRes.writeHead(404, { "Content-Type": "application/json" });
+          nodeRes.end(JSON.stringify({ error: "Document not found", file: fileParam, similar: result.similarFiles?.slice(0, 5) }));
+          log(`${ts()} GET /get 404 file=${fileParam} (${Date.now() - reqStart}ms)`);
+          return;
+        }
+        const body = await store.getDocumentBody(result.filepath) ?? "";
+        nodeRes.writeHead(200, { "Content-Type": "text/markdown; charset=utf-8" });
+        nodeRes.end(body);
+        log(`${ts()} GET /get file=${fileParam} (${body.length}c, ${Date.now() - reqStart}ms)`);
+        return;
+      }
+
+      // ── REST: POST /query-full — full qmd query with expand + rerank (via CLI) ──
+      if (pathname === "/query-full" && nodeReq.method === "POST") {
+        const rawBody = await collectBody(nodeReq);
+        let params: any = {};
+        try { params = JSON.parse(rawBody); } catch {}
+        const query = params.query ?? "";
+        const limit = params.limit ?? 10;
+        const collections = params.collections as string[] | undefined;
+        if (!query) {
+          nodeRes.writeHead(400, { "Content-Type": "application/json" });
+          nodeRes.end(JSON.stringify({ error: "Missing query in JSON body" }));
+          return;
+        }
+        try {
+          const args = ["/app/dist/cli/qmd.js", "query", query, "--json", "-n", String(limit)];
+          if (collections?.length) {
+            for (const col of collections) {
+              args.push("-c", col);
+            }
+          }
+          const stdout = execFileSync("node", args, {
+            env: process.env, timeout: 120000, maxBuffer: 10 * 1024 * 1024
+          }).toString();
+          const results = JSON.parse(stdout);
+          nodeRes.writeHead(200, { "Content-Type": "application/json" });
+          nodeRes.end(JSON.stringify({ results }));
+          log(`${ts()} POST /query-full "${query.slice(0, 60)}" (${Date.now() - reqStart}ms)`);
+        } catch (e: any) {
+          nodeRes.writeHead(500, { "Content-Type": "application/json" });
+          nodeRes.end(JSON.stringify({ error: "Query failed", detail: e.message?.slice(0, 200) }));
+          log(`${ts()} POST /query-full ERROR "${query.slice(0, 60)}" (${Date.now() - reqStart}ms)`);
+        }
+        return;
+      }
+
+      // ── REST: POST /search-bm25 — BM25 keyword search (via CLI `search`) ──
+      if (pathname === "/search-bm25" && nodeReq.method === "POST") {
+        const rawBody = await collectBody(nodeReq);
+        let params: any = {};
+        try { params = JSON.parse(rawBody); } catch {}
+        const query = params.query ?? "";
+        const limit = params.limit ?? 10;
+        const collections = params.collections as string[] | undefined;
+        const minScore = params.min_score;
+        if (!query) {
+          nodeRes.writeHead(400, { "Content-Type": "application/json" });
+          nodeRes.end(JSON.stringify({ error: "Missing query in JSON body" }));
+          return;
+        }
+        try {
+          const args = ["/app/dist/cli/qmd.js", "search", query, "--json", "-n", String(limit)];
+          if (collections?.length) {
+            for (const col of collections) {
+              args.push("-c", col);
+            }
+          }
+          if (minScore !== undefined) {
+            args.push("--min-score", String(minScore));
+          }
+          const stdout = execFileSync("node", args, {
+            env: process.env, timeout: 30000, maxBuffer: 10 * 1024 * 1024
+          }).toString();
+          const results = JSON.parse(stdout);
+          nodeRes.writeHead(200, { "Content-Type": "application/json" });
+          nodeRes.end(JSON.stringify({ results }));
+          log(`${ts()} POST /search-bm25 "${query.slice(0, 60)}" ${results.length} hits (${Date.now() - reqStart}ms)`);
+        } catch (e: any) {
+          nodeRes.writeHead(500, { "Content-Type": "application/json" });
+          nodeRes.end(JSON.stringify({ error: "Search failed", detail: e.message?.slice(0, 200) }));
+          log(`${ts()} POST /search-bm25 ERROR "${query.slice(0, 60)}" (${Date.now() - reqStart}ms)`);
+        }
+        return;
+      }
+
+      // ── REST: POST /search-vector — vector similarity search (via CLI `vsearch`) ──
+      if (pathname === "/search-vector" && nodeReq.method === "POST") {
+        const rawBody = await collectBody(nodeReq);
+        let params: any = {};
+        try { params = JSON.parse(rawBody); } catch {}
+        const query = params.query ?? "";
+        const limit = params.limit ?? 10;
+        const collections = params.collections as string[] | undefined;
+        const minScore = params.min_score;
+        if (!query) {
+          nodeRes.writeHead(400, { "Content-Type": "application/json" });
+          nodeRes.end(JSON.stringify({ error: "Missing query in JSON body" }));
+          return;
+        }
+        try {
+          const args = ["/app/dist/cli/qmd.js", "vsearch", query, "--json", "-n", String(limit)];
+          if (collections?.length) {
+            for (const col of collections) {
+              args.push("-c", col);
+            }
+          }
+          if (minScore !== undefined) {
+            args.push("--min-score", String(minScore));
+          }
+          const stdout = execFileSync("node", args, {
+            env: process.env, timeout: 60000, maxBuffer: 10 * 1024 * 1024
+          }).toString();
+          const results = JSON.parse(stdout);
+          nodeRes.writeHead(200, { "Content-Type": "application/json" });
+          nodeRes.end(JSON.stringify({ results }));
+          log(`${ts()} POST /search-vector "${query.slice(0, 60)}" ${results.length} hits (${Date.now() - reqStart}ms)`);
+        } catch (e: any) {
+          nodeRes.writeHead(500, { "Content-Type": "application/json" });
+          nodeRes.end(JSON.stringify({ error: "Vector search failed", detail: e.message?.slice(0, 200) }));
+          log(`${ts()} POST /search-vector ERROR "${query.slice(0, 60)}" (${Date.now() - reqStart}ms)`);
+        }
+        return;
+      }
+
+      // ── REST: POST /update — trigger BM25 re-index (background) ──
+      if (pathname === "/update" && nodeReq.method === "POST") {
+        execFile("node", ["/app/dist/cli/qmd.js", "update"], { env: process.env }, (err, stdout, stderr) => {
+          if (err) console.error("Update failed:", stderr);
+          else console.error("Update complete:", stdout.trim());
+        });
+        nodeRes.writeHead(200, { "Content-Type": "application/json" });
+        nodeRes.end(JSON.stringify({ status: "ok", message: "Re-index triggered in background" }));
+        log(`${ts()} POST /update triggered (${Date.now() - reqStart}ms)`);
+        return;
+      }
+
+      // ── REST: POST /embed — trigger vector embedding generation (background) ──
+      if (pathname === "/embed" && nodeReq.method === "POST") {
+        execFile("node", ["/app/dist/cli/qmd.js", "embed"], { env: process.env }, (err, stdout, stderr) => {
+          if (err) console.error("Embed failed:", stderr);
+          else console.error("Embed complete:", stdout.trim());
+        });
+        nodeRes.writeHead(200, { "Content-Type": "application/json" });
+        nodeRes.end(JSON.stringify({ status: "ok", message: "Embedding generation triggered in background" }));
+        log(`${ts()} POST /embed triggered (${Date.now() - reqStart}ms)`);
+        return;
+      }
+
       if (pathname === "/mcp" && nodeReq.method === "POST") {
         const rawBody = await collectBody(nodeReq);
         const body = JSON.parse(rawBody);
@@ -769,7 +1077,7 @@ export async function startMcpHttpServer(port: number, options?: { quiet?: boole
 
   await new Promise<void>((resolve, reject) => {
     httpServer.on("error", reject);
-    httpServer.listen(port, "localhost", () => resolve());
+    httpServer.listen(port, "0.0.0.0", () => resolve());
   });
 
   const actualPort = (httpServer.address() as import("net").AddressInfo).port;

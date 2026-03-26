@@ -318,6 +318,11 @@ export interface LLM {
   embed(text: string, options?: EmbedOptions): Promise<EmbeddingResult | null>;
 
   /**
+   * Batch embed multiple texts
+   */
+  embedBatch(texts: string[]): Promise<(EmbeddingResult | null)[]>;
+
+  /**
    * Generate text completion
    */
   generate(prompt: string, options?: GenerateOptions): Promise<GenerateResult | null>;
@@ -331,7 +336,7 @@ export interface LLM {
    * Expand a search query into multiple variations for different backends.
    * Returns a list of Queryable objects.
    */
-  expandQuery(query: string, options?: { context?: string, includeLexical?: boolean }): Promise<Queryable[]>;
+  expandQuery(query: string, options?: { context?: string, includeLexical?: boolean, intent?: string }): Promise<Queryable[]>;
 
   /**
    * Rerank documents by relevance to a query
@@ -832,42 +837,15 @@ export class LlamaCpp implements LLM {
   // Core API methods
   // ==========================================================================
 
-  /**
-   * Truncate text to fit within the embedding model's context window.
-   * Uses the model's own tokenizer for accurate token counting, then
-   * detokenizes back to text if truncation is needed.
-   * Returns the (possibly truncated) text and whether truncation occurred.
-   */
-  private async truncateToContextSize(text: string): Promise<{ text: string; truncated: boolean }> {
-    if (!this.embedModel) return { text, truncated: false };
-
-    const maxTokens = this.embedModel.trainContextSize;
-    if (maxTokens <= 0) return { text, truncated: false };
-
-    const tokens = this.embedModel.tokenize(text);
-    if (tokens.length <= maxTokens) return { text, truncated: false };
-
-    // Leave a small margin (4 tokens) for BOS/EOS overhead
-    const safeLimit = Math.max(1, maxTokens - 4);
-    const truncatedTokens = tokens.slice(0, safeLimit);
-    const truncatedText = this.embedModel.detokenize(truncatedTokens);
-    return { text: truncatedText, truncated: true };
-  }
-
   async embed(text: string, options: EmbedOptions = {}): Promise<EmbeddingResult | null> {
+    // Skip if embed model disabled (remote LLM handles embedding)
+    if (this.embedModelUri === "skip") return null;
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
 
     try {
       const context = await this.ensureEmbedContext();
-
-      // Guard: truncate text that exceeds model context window to prevent GGML crash
-      const { text: safeText, truncated } = await this.truncateToContextSize(text);
-      if (truncated) {
-        console.warn(`⚠ Text truncated to fit embedding context (${this.embedModel?.trainContextSize} tokens)`);
-      }
-
-      const embedding = await context.getEmbeddingFor(safeText);
+      const embedding = await context.getEmbeddingFor(text);
 
       return {
         embedding: Array.from(embedding.vector),
@@ -884,6 +862,7 @@ export class LlamaCpp implements LLM {
    * Uses Promise.all for parallel embedding - node-llama-cpp handles batching internally
    */
   async embedBatch(texts: string[]): Promise<(EmbeddingResult | null)[]> {
+    if (this.embedModelUri === "skip") return texts.map(() => null);
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
@@ -900,11 +879,7 @@ export class LlamaCpp implements LLM {
         const embeddings: ({ embedding: number[]; model: string } | null)[] = [];
         for (const text of texts) {
           try {
-            const { text: safeText, truncated } = await this.truncateToContextSize(text);
-            if (truncated) {
-              console.warn(`⚠ Batch text truncated to fit embedding context (${this.embedModel?.trainContextSize} tokens)`);
-            }
-            const embedding = await context.getEmbeddingFor(safeText);
+            const embedding = await context.getEmbeddingFor(text);
             this.touchActivity();
             embeddings.push({ embedding: Array.from(embedding.vector), model: this.embedModelUri });
           } catch (err) {
@@ -927,11 +902,7 @@ export class LlamaCpp implements LLM {
           const results: (EmbeddingResult | null)[] = [];
           for (const text of chunk) {
             try {
-              const { text: safeText, truncated } = await this.truncateToContextSize(text);
-              if (truncated) {
-                console.warn(`⚠ Batch text truncated to fit embedding context (${this.embedModel?.trainContextSize} tokens)`);
-              }
-              const embedding = await ctx.getEmbeddingFor(safeText);
+              const embedding = await ctx.getEmbeddingFor(text);
               this.touchActivity();
               results.push({ embedding: Array.from(embedding.vector), model: this.embedModelUri });
             } catch (err) {
@@ -1108,6 +1079,10 @@ export class LlamaCpp implements LLM {
     documents: RerankDocument[],
     options: RerankOptions = {}
   ): Promise<RerankResult> {
+    // Skip if rerank model disabled (remote LLM handles reranking)
+    if (this.rerankModelUri === "skip") {
+      return { results: documents.map((d, i) => ({ file: d.file, score: 0.5, index: i })), model: "skip" };
+    }
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
@@ -1274,11 +1249,11 @@ export class LlamaCpp implements LLM {
  * Coordinates with LlamaCpp idle timeout to prevent disposal during active sessions.
  */
 class LLMSessionManager {
-  private llm: LlamaCpp;
+  private llm: LLM;
   private _activeSessionCount = 0;
   private _inFlightOperations = 0;
 
-  constructor(llm: LlamaCpp) {
+  constructor(llm: LLM) {
     this.llm = llm;
   }
 
@@ -1315,6 +1290,10 @@ class LLMSessionManager {
   }
 
   getLlamaCpp(): LlamaCpp {
+    return this.llm as LlamaCpp;
+  }
+
+  getLlm(): LLM {
     return this.llm;
   }
 }
@@ -1417,18 +1396,18 @@ class LLMSession implements ILLMSession {
   }
 
   async embed(text: string, options?: EmbedOptions): Promise<EmbeddingResult | null> {
-    return this.withOperation(() => this.manager.getLlamaCpp().embed(text, options));
+    return this.withOperation(() => this.manager.getLlm().embed(text, options));
   }
 
   async embedBatch(texts: string[]): Promise<(EmbeddingResult | null)[]> {
-    return this.withOperation(() => this.manager.getLlamaCpp().embedBatch(texts));
+    return this.withOperation(() => this.manager.getLlm().embedBatch(texts));
   }
 
   async expandQuery(
     query: string,
     options?: { context?: string; includeLexical?: boolean }
   ): Promise<Queryable[]> {
-    return this.withOperation(() => this.manager.getLlamaCpp().expandQuery(query, options));
+    return this.withOperation(() => this.manager.getLlm().expandQuery(query, options));
   }
 
   async rerank(
@@ -1436,7 +1415,7 @@ class LLMSession implements ILLMSession {
     documents: RerankDocument[],
     options?: RerankOptions
   ): Promise<RerankResult> {
-    return this.withOperation(() => this.manager.getLlamaCpp().rerank(query, documents, options));
+    return this.withOperation(() => this.manager.getLlm().rerank(query, documents, options));
   }
 }
 
@@ -1487,7 +1466,7 @@ export async function withLLMSession<T>(
  * Unlike withLLMSession, this does not use the global singleton.
  */
 export async function withLLMSessionForLlm<T>(
-  llm: LlamaCpp,
+  llm: LLM,
   fn: (session: ILLMSession) => Promise<T>,
   options?: LLMSessionOptions
 ): Promise<T> {
@@ -1517,12 +1496,27 @@ export function canUnloadLLM(): boolean {
 let defaultLlamaCpp: LlamaCpp | null = null;
 
 /**
- * Get the default LlamaCpp instance (creates one if needed)
+ * Get the default LlamaCpp instance (creates one if needed).
+ *
+ * When remote embed/rerank URLs are configured (QMD_EMBED_URL / QMD_RERANK_URL),
+ * this instance is only used for query expansion (generate model).
+ * Embed and rerank models are set to "skip" to prevent unnecessary GGUF downloads.
  */
 export function getDefaultLlamaCpp(): LlamaCpp {
   if (!defaultLlamaCpp) {
     const embedModel = process.env.QMD_EMBED_MODEL;
-    defaultLlamaCpp = new LlamaCpp(embedModel ? { embedModel } : {});
+    const config: LlamaCppConfig = embedModel ? { embedModel } : {};
+
+    // When remote LLM is configured, only load query expansion model locally.
+    // Set embed/rerank to "skip" to prevent GGUF downloads — these are handled by remote HTTP.
+    if (process.env.QMD_EMBED_URL) {
+      config.embedModel = "skip";
+    }
+    if (process.env.QMD_RERANK_URL) {
+      config.rerankModel = "skip";
+    }
+
+    defaultLlamaCpp = new LlamaCpp(config);
   }
   return defaultLlamaCpp;
 }
