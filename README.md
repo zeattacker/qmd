@@ -8,6 +8,31 @@ QMD combines BM25 full-text search, vector semantic search, and LLM re-rankingâ€
 
 You can read more about QMD's progress in the [CHANGELOG](CHANGELOG.md).
 
+## Dev Branch
+
+The `dev` branch is **19 commits ahead of `main`** and contains the following unreleased changes:
+
+### Remote Embed/Rerank Support
+- HTTP-based embedding and reranking via a remote server, switching the default embedding model to **bge-m3** for better multilingual coverage
+- HTTP server now binds to `127.0.0.1` instead of `localhost` (fixes IPv6 resolution issues)
+- New `QMD_RERANK_CONTEXT_SIZE` env var; default increased from 2048 to 4096 tokens
+
+### MCP Server Enhancements
+- **`refresh`** and **`embed`** MCP tools for triggering index maintenance from MCP clients
+- **`plain` query parameter** on the `query` tool â€” sends a raw query string that QMD auto-expands (no need to build sub-queries manually)
+- Collection name now included in `status` tool output
+
+### Search & Indexing Fixes
+- **50x FTS5 speedup** when filtering by collection (CTE rewrite, [#455](https://github.com/tobi/qmd/issues/455))
+- BM25 field weights now cover all 3 FTS columns ([#462](https://github.com/tobi/qmd/issues/462))
+- Hyphenated and underscore tokens handled correctly in lex and vec/HyDE queries ([#463](https://github.com/tobi/qmd/issues/463))
+- `vec0 OR REPLACE` limitation handled in embedding inserts
+- SQLite startup race condition fixed for parallel Bun initialization
+
+### Tooling & Infra
+- OCR script (`ocr-pdf.py`) for PDF/image OCR via Tesseract
+- Updated build config, CI workflows, and test suite for openclaw fork changes
+
 ## Quick Start
 
 ```sh
