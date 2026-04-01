@@ -46,6 +46,8 @@ export const DEFAULT_RERANK_MODEL = "ExpedientFalcon/qwen3-reranker:0.6b-q8_0";
 export const DEFAULT_QUERY_MODEL = "Qwen/Qwen3-1.7B";
 export const DEFAULT_GLOB = "**/*.md";
 export const DEFAULT_MULTI_GET_MAX_BYTES = 10 * 1024; // 10KB
+export const DEFAULT_EMBED_MAX_DOCS_PER_BATCH = 64;
+export const DEFAULT_EMBED_MAX_BATCH_BYTES = 64 * 1024 * 1024; // 64MB
 
 // Chunking: 900 tokens per chunk with 15% overlap
 // Increased from 800 to accommodate smart chunking finding natural break points
@@ -221,6 +223,89 @@ export function findBestCutoff(
   }
 
   return bestPos;
+}
+
+// =============================================================================
+// Chunk Strategy
+// =============================================================================
+
+export type ChunkStrategy = "auto" | "regex";
+
+/**
+ * Merge two sets of break points (e.g. regex + AST), keeping the highest
+ * score at each position. Result is sorted by position.
+ */
+export function mergeBreakPoints(a: BreakPoint[], b: BreakPoint[]): BreakPoint[] {
+  const seen = new Map<number, BreakPoint>();
+  for (const bp of a) {
+    const existing = seen.get(bp.pos);
+    if (!existing || bp.score > existing.score) {
+      seen.set(bp.pos, bp);
+    }
+  }
+  for (const bp of b) {
+    const existing = seen.get(bp.pos);
+    if (!existing || bp.score > existing.score) {
+      seen.set(bp.pos, bp);
+    }
+  }
+  return Array.from(seen.values()).sort((a, b) => a.pos - b.pos);
+}
+
+/**
+ * Core chunk algorithm that operates on precomputed break points and code fences.
+ * This is the shared implementation used by both regex-only and AST-aware chunking.
+ */
+export function chunkDocumentWithBreakPoints(
+  content: string,
+  breakPoints: BreakPoint[],
+  codeFences: CodeFenceRegion[],
+  maxChars: number = CHUNK_SIZE_CHARS,
+  overlapChars: number = CHUNK_OVERLAP_CHARS,
+  windowChars: number = CHUNK_WINDOW_CHARS
+): { text: string; pos: number }[] {
+  if (content.length <= maxChars) {
+    return [{ text: content, pos: 0 }];
+  }
+
+  const chunks: { text: string; pos: number }[] = [];
+  let charPos = 0;
+
+  while (charPos < content.length) {
+    const targetEndPos = Math.min(charPos + maxChars, content.length);
+    let endPos = targetEndPos;
+
+    if (endPos < content.length) {
+      const bestCutoff = findBestCutoff(
+        breakPoints,
+        targetEndPos,
+        windowChars,
+        0.7,
+        codeFences
+      );
+
+      if (bestCutoff > charPos && bestCutoff <= targetEndPos) {
+        endPos = bestCutoff;
+      }
+    }
+
+    if (endPos <= charPos) {
+      endPos = Math.min(charPos + maxChars, content.length);
+    }
+
+    chunks.push({ text: content.slice(charPos, endPos), pos: charPos });
+
+    if (endPos >= content.length) {
+      break;
+    }
+    charPos = endPos - overlapChars;
+    const lastChunkPos = chunks.at(-1)!.pos;
+    if (charPos <= lastChunkPos) {
+      charPos = endPos;
+    }
+  }
+
+  return chunks;
 }
 
 // Hybrid query: strong BM25 signal detection thresholds
@@ -1212,6 +1297,110 @@ export type EmbedResult = {
   durationMs: number;
 };
 
+export type EmbedOptions = {
+  force?: boolean;
+  model?: string;
+  maxDocsPerBatch?: number;
+  maxBatchBytes?: number;
+  chunkStrategy?: ChunkStrategy;
+  onProgress?: (info: EmbedProgress) => void;
+};
+
+type PendingEmbeddingDoc = {
+  hash: string;
+  path: string;
+  bytes: number;
+};
+
+type EmbeddingDoc = PendingEmbeddingDoc & {
+  body: string;
+};
+
+type ChunkItem = {
+  hash: string;
+  title: string;
+  text: string;
+  seq: number;
+  pos: number;
+  tokens: number;
+  bytes: number;
+};
+
+function validatePositiveIntegerOption(name: string, value: number | undefined, fallback: number): number {
+  if (value === undefined) return fallback;
+  if (!Number.isInteger(value) || value < 1) {
+    throw new Error(`${name} must be a positive integer`);
+  }
+  return value;
+}
+
+function resolveEmbedOptions(options?: EmbedOptions): Required<Pick<EmbedOptions, "maxDocsPerBatch" | "maxBatchBytes">> {
+  return {
+    maxDocsPerBatch: validatePositiveIntegerOption("maxDocsPerBatch", options?.maxDocsPerBatch, DEFAULT_EMBED_MAX_DOCS_PER_BATCH),
+    maxBatchBytes: validatePositiveIntegerOption("maxBatchBytes", options?.maxBatchBytes, DEFAULT_EMBED_MAX_BATCH_BYTES),
+  };
+}
+
+function getPendingEmbeddingDocs(db: Database): PendingEmbeddingDoc[] {
+  return db.prepare(`
+    SELECT d.hash, MIN(d.path) as path, length(CAST(c.doc AS BLOB)) as bytes
+    FROM documents d
+    JOIN content c ON d.hash = c.hash
+    LEFT JOIN content_vectors v ON d.hash = v.hash AND v.seq = 0
+    WHERE d.active = 1 AND v.hash IS NULL
+    GROUP BY d.hash
+    ORDER BY MIN(d.path)
+  `).all() as PendingEmbeddingDoc[];
+}
+
+function buildEmbeddingBatches(
+  docs: PendingEmbeddingDoc[],
+  maxDocsPerBatch: number,
+  maxBatchBytes: number,
+): PendingEmbeddingDoc[][] {
+  const batches: PendingEmbeddingDoc[][] = [];
+  let currentBatch: PendingEmbeddingDoc[] = [];
+  let currentBytes = 0;
+
+  for (const doc of docs) {
+    const docBytes = Math.max(0, doc.bytes);
+    const wouldExceedDocs = currentBatch.length >= maxDocsPerBatch;
+    const wouldExceedBytes = currentBatch.length > 0 && (currentBytes + docBytes) > maxBatchBytes;
+
+    if (wouldExceedDocs || wouldExceedBytes) {
+      batches.push(currentBatch);
+      currentBatch = [];
+      currentBytes = 0;
+    }
+
+    currentBatch.push(doc);
+    currentBytes += docBytes;
+  }
+
+  if (currentBatch.length > 0) {
+    batches.push(currentBatch);
+  }
+
+  return batches;
+}
+
+function getEmbeddingDocsForBatch(db: Database, batch: PendingEmbeddingDoc[]): EmbeddingDoc[] {
+  if (batch.length === 0) return [];
+
+  const placeholders = batch.map(() => "?").join(",");
+  const rows = db.prepare(`
+    SELECT hash, doc as body
+    FROM content
+    WHERE hash IN (${placeholders})
+  `).all(...batch.map(doc => doc.hash)) as { hash: string; body: string }[];
+  const bodyByHash = new Map(rows.map(row => [row.hash, row.body]));
+
+  return batch.map((doc) => ({
+    ...doc,
+    body: bodyByHash.get(doc.hash) ?? "",
+  }));
+}
+
 /**
  * Generate vector embeddings for documents that need them.
  * Pure function — no console output, no db lifecycle management.
@@ -1219,120 +1408,176 @@ export type EmbedResult = {
  */
 export async function generateEmbeddings(
   store: Store,
-  options?: {
-    force?: boolean;
-    model?: string;
-    onProgress?: (info: EmbedProgress) => void;
-  }
+  options?: EmbedOptions
 ): Promise<EmbedResult> {
   const db = store.db;
   const model = options?.model ?? DEFAULT_EMBED_MODEL;
   const now = new Date().toISOString();
+  const { maxDocsPerBatch, maxBatchBytes } = resolveEmbedOptions(options);
+  const encoder = new TextEncoder();
 
   if (options?.force) {
     clearAllEmbeddings(db);
   }
 
-  const hashesToEmbed = getHashesForEmbedding(db);
+  const docsToEmbed = getPendingEmbeddingDocs(db);
 
-  if (hashesToEmbed.length === 0) {
+  if (docsToEmbed.length === 0) {
     return { docsProcessed: 0, chunksEmbedded: 0, errors: 0, durationMs: 0 };
   }
-
-  // Chunk all documents
-  type ChunkItem = { hash: string; title: string; text: string; seq: number; pos: number; tokens: number; bytes: number };
-  const allChunks: ChunkItem[] = [];
-
-  for (const item of hashesToEmbed) {
-    const encoder = new TextEncoder();
-    const bodyBytes = encoder.encode(item.body).length;
-    if (bodyBytes === 0) continue;
-
-    const title = extractTitle(item.body, item.path);
-    const chunks = await chunkDocumentByTokens(item.body);
-
-    for (let seq = 0; seq < chunks.length; seq++) {
-      allChunks.push({
-        hash: item.hash,
-        title,
-        text: chunks[seq]!.text,
-        seq,
-        pos: chunks[seq]!.pos,
-        tokens: chunks[seq]!.tokens,
-        bytes: encoder.encode(chunks[seq]!.text).length,
-      });
-    }
-  }
-
-  if (allChunks.length === 0) {
-    return { docsProcessed: 0, chunksEmbedded: 0, errors: 0, durationMs: 0 };
-  }
-
-  const totalBytes = allChunks.reduce((sum, chk) => sum + chk.bytes, 0);
-  const totalChunks = allChunks.length;
-  const totalDocs = hashesToEmbed.length;
+  const totalBytes = docsToEmbed.reduce((sum, doc) => sum + Math.max(0, doc.bytes), 0);
+  const totalDocs = docsToEmbed.length;
   const startTime = Date.now();
 
   // Use store's LlamaCpp or global singleton, wrapped in a session
   const llm = getLlm(store);
-  const sessionOptions: LLMSessionOptions = { maxDuration: 4 * 60 * 60 * 1000, name: 'generateEmbeddings' };
 
   // Create a session manager for this llm instance
   const result = await withLLMSessionForLlm(llm, async (session) => {
-    // Get embedding dimensions from first chunk
-    const firstChunk = allChunks[0]!;
-    const firstText = formatDocForEmbedding(firstChunk.text, firstChunk.title);
-    const firstResult = await session.embed(firstText);
-    if (!firstResult) {
-      throw new Error("Failed to get embedding dimensions from first chunk");
-    }
-    store.ensureVecTable(firstResult.embedding.length);
-
-    let chunksEmbedded = 0, errors = 0, bytesProcessed = 0;
+    let chunksEmbedded = 0;
+    let errors = 0;
+    let bytesProcessed = 0;
+    let totalChunks = 0;
+    let vectorTableInitialized = false;
     const BATCH_SIZE = 32;
+    const batches = buildEmbeddingBatches(docsToEmbed, maxDocsPerBatch, maxBatchBytes);
 
-    for (let batchStart = 0; batchStart < allChunks.length; batchStart += BATCH_SIZE) {
-      const batchEnd = Math.min(batchStart + BATCH_SIZE, allChunks.length);
-      const batch = allChunks.slice(batchStart, batchEnd);
-      const texts = batch.map(chunk => formatDocForEmbedding(chunk.text, chunk.title));
+    for (const batchMeta of batches) {
+      // Abort early if session has been invalidated
+      if (!session.isValid) {
+        console.warn(`\u26a0 Session expired \u2014 skipping remaining document batches`);
+        break;
+      }
 
-      try {
-        const embeddings = await session.embedBatch(texts);
-        for (let i = 0; i < batch.length; i++) {
-          const chunk = batch[i]!;
-          const embedding = embeddings[i];
-          if (embedding) {
-            insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(embedding.embedding), model, now);
-            chunksEmbedded++;
-          } else {
-            errors++;
-          }
-          bytesProcessed += chunk.bytes;
+      const batchDocs = getEmbeddingDocsForBatch(db, batchMeta);
+      const batchChunks: ChunkItem[] = [];
+      const batchBytes = batchMeta.reduce((sum, doc) => sum + Math.max(0, doc.bytes), 0);
+
+      for (const doc of batchDocs) {
+        if (!doc.body.trim()) continue;
+
+        const title = extractTitle(doc.body, doc.path);
+        const chunks = await chunkDocumentByTokens(
+          doc.body,
+          undefined, undefined, undefined,
+          doc.path,
+          options?.chunkStrategy,
+          session.signal,
+        );
+
+        for (let seq = 0; seq < chunks.length; seq++) {
+          batchChunks.push({
+            hash: doc.hash,
+            title,
+            text: chunks[seq]!.text,
+            seq,
+            pos: chunks[seq]!.pos,
+            tokens: chunks[seq]!.tokens,
+            bytes: encoder.encode(chunks[seq]!.text).length,
+          });
         }
-      } catch {
-        // Batch failed — try individual embeddings as fallback
-        for (const chunk of batch) {
-          try {
-            const text = formatDocForEmbedding(chunk.text, chunk.title);
-            const result = await session.embed(text);
-            if (result) {
-              insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), model, now);
+      }
+
+      totalChunks += batchChunks.length;
+
+      if (batchChunks.length === 0) {
+        bytesProcessed += batchBytes;
+        options?.onProgress?.({ chunksEmbedded, totalChunks, bytesProcessed, totalBytes, errors });
+        continue;
+      }
+
+      if (!vectorTableInitialized) {
+        const firstChunk = batchChunks[0]!;
+        const firstText = formatDocForEmbedding(firstChunk.text, firstChunk.title);
+        const firstResult = await session.embed(firstText);
+        if (!firstResult) {
+          throw new Error("Failed to get embedding dimensions from first chunk");
+        }
+        store.ensureVecTable(firstResult.embedding.length);
+        vectorTableInitialized = true;
+      }
+
+      const totalBatchChunkBytes = batchChunks.reduce((sum, chunk) => sum + chunk.bytes, 0);
+      let batchChunkBytesProcessed = 0;
+
+      for (let batchStart = 0; batchStart < batchChunks.length; batchStart += BATCH_SIZE) {
+        // Abort early if session has been invalidated (e.g. max duration exceeded)
+        if (!session.isValid) {
+          const remaining = batchChunks.length - batchStart;
+          errors += remaining;
+          console.warn(`\u26a0 Session expired \u2014 skipping ${remaining} remaining chunks`);
+          break;
+        }
+
+        // Abort early if error rate is too high (>80% of processed chunks failed)
+        const processed = chunksEmbedded + errors;
+        if (processed >= BATCH_SIZE && errors > processed * 0.8) {
+          const remaining = batchChunks.length - batchStart;
+          errors += remaining;
+          console.warn(`\u26a0 Error rate too high (${errors}/${processed}) \u2014 aborting embedding`);
+          break;
+        }
+
+        const batchEnd = Math.min(batchStart + BATCH_SIZE, batchChunks.length);
+        const chunkBatch = batchChunks.slice(batchStart, batchEnd);
+        const texts = chunkBatch.map(chunk => formatDocForEmbedding(chunk.text, chunk.title));
+
+        try {
+          const embeddings = await session.embedBatch(texts);
+          for (let i = 0; i < chunkBatch.length; i++) {
+            const chunk = chunkBatch[i]!;
+            const embedding = embeddings[i];
+            if (embedding) {
+              insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(embedding.embedding), model, now);
               chunksEmbedded++;
             } else {
               errors++;
             }
-          } catch {
-            errors++;
+            batchChunkBytesProcessed += chunk.bytes;
           }
-          bytesProcessed += chunk.bytes;
+        } catch {
+          // Batch failed — try individual embeddings as fallback
+          // But skip if session is already invalid (avoids N doomed retries)
+          if (!session.isValid) {
+            errors += chunkBatch.length;
+            batchChunkBytesProcessed += chunkBatch.reduce((sum, c) => sum + c.bytes, 0);
+          } else {
+            for (const chunk of chunkBatch) {
+              try {
+                const text = formatDocForEmbedding(chunk.text, chunk.title);
+                const result = await session.embed(text);
+                if (result) {
+                  insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), model, now);
+                  chunksEmbedded++;
+                } else {
+                  errors++;
+                }
+              } catch {
+                errors++;
+              }
+              batchChunkBytesProcessed += chunk.bytes;
+            }
+          }
         }
+
+        const proportionalBytes = totalBatchChunkBytes === 0
+          ? batchBytes
+          : Math.min(batchBytes, Math.round((batchChunkBytesProcessed / totalBatchChunkBytes) * batchBytes));
+        options?.onProgress?.({
+          chunksEmbedded,
+          totalChunks,
+          bytesProcessed: bytesProcessed + proportionalBytes,
+          totalBytes,
+          errors,
+        });
       }
 
+      bytesProcessed += batchBytes;
       options?.onProgress?.({ chunksEmbedded, totalChunks, bytesProcessed, totalBytes, errors });
     }
 
     return { chunksEmbedded, errors };
-  }, sessionOptions);
+  }, { maxDuration: 30 * 60 * 1000, name: 'generateEmbeddings' });
 
   return {
     docsProcessed: totalDocs,
@@ -1491,7 +1736,6 @@ export function handelize(path: string): string {
 
   const result = path
     .replace(/___/g, '/')       // Triple underscore becomes folder separator
-    .toLowerCase()
     .split('/')
     .map((segment, idx, arr) => {
       const isLastSegment = idx === arr.length - 1;
@@ -1506,7 +1750,7 @@ export function handelize(path: string): string {
         const nameWithoutExt = ext ? segment.slice(0, -ext.length) : segment;
 
         const cleanedName = nameWithoutExt
-          .replace(/[^\p{L}\p{N}$]+/gu, '-')  // Keep route marker "$", dash-separate other chars
+          .replace(/[^\p{L}\p{N}.$]+/gu, '-')  // Keep letters, numbers, dots, "$"; dash-separate rest
           .replace(/^-+|-+$/g, ''); // Remove leading/trailing dashes
 
         return cleanedName + ext;
@@ -1909,78 +2153,67 @@ export function getActiveDocumentPaths(db: Database, collectionName: string): st
 
 export { formatQueryForEmbedding, formatDocForEmbedding };
 
+/**
+ * Chunk a document using regex-only break point detection.
+ * This is the sync, backward-compatible API used by tests and legacy callers.
+ */
 export function chunkDocument(
   content: string,
   maxChars: number = CHUNK_SIZE_CHARS,
   overlapChars: number = CHUNK_OVERLAP_CHARS,
   windowChars: number = CHUNK_WINDOW_CHARS
 ): { text: string; pos: number }[] {
-  if (content.length <= maxChars) {
-    return [{ text: content, pos: 0 }];
-  }
-
-  // Pre-scan all break points and code fences once
   const breakPoints = scanBreakPoints(content);
   const codeFences = findCodeFences(content);
+  return chunkDocumentWithBreakPoints(content, breakPoints, codeFences, maxChars, overlapChars, windowChars);
+}
 
-  const chunks: { text: string; pos: number }[] = [];
-  let charPos = 0;
+/**
+ * Async AST-aware chunking. Detects language from filepath, computes AST
+ * break points for supported code files, merges with regex break points,
+ * and delegates to the shared chunk algorithm.
+ *
+ * Falls back to regex-only when strategy is "regex", filepath is absent,
+ * or language is unsupported.
+ */
+export async function chunkDocumentAsync(
+  content: string,
+  maxChars: number = CHUNK_SIZE_CHARS,
+  overlapChars: number = CHUNK_OVERLAP_CHARS,
+  windowChars: number = CHUNK_WINDOW_CHARS,
+  filepath?: string,
+  chunkStrategy: ChunkStrategy = "regex",
+): Promise<{ text: string; pos: number }[]> {
+  const regexPoints = scanBreakPoints(content);
+  const codeFences = findCodeFences(content);
 
-  while (charPos < content.length) {
-    // Calculate target end position for this chunk
-    const targetEndPos = Math.min(charPos + maxChars, content.length);
-
-    let endPos = targetEndPos;
-
-    // If not at the end, find the best break point
-    if (endPos < content.length) {
-      // Find best cutoff using scored algorithm
-      const bestCutoff = findBestCutoff(
-        breakPoints,
-        targetEndPos,
-        windowChars,
-        0.7,
-        codeFences
-      );
-
-      // Only use the cutoff if it's within our current chunk
-      if (bestCutoff > charPos && bestCutoff <= targetEndPos) {
-        endPos = bestCutoff;
-      }
-    }
-
-    // Ensure we make progress
-    if (endPos <= charPos) {
-      endPos = Math.min(charPos + maxChars, content.length);
-    }
-
-    chunks.push({ text: content.slice(charPos, endPos), pos: charPos });
-
-    // Move forward, but overlap with previous chunk
-    // For last chunk, don't overlap (just go to the end)
-    if (endPos >= content.length) {
-      break;
-    }
-    charPos = endPos - overlapChars;
-    const lastChunkPos = chunks.at(-1)!.pos;
-    if (charPos <= lastChunkPos) {
-      // Prevent infinite loop - move forward at least a bit
-      charPos = endPos;
+  let breakPoints = regexPoints;
+  if (chunkStrategy === "auto" && filepath) {
+    const { getASTBreakPoints } = await import("./ast.js");
+    const astPoints = await getASTBreakPoints(content, filepath);
+    if (astPoints.length > 0) {
+      breakPoints = mergeBreakPoints(regexPoints, astPoints);
     }
   }
 
-  return chunks;
+  return chunkDocumentWithBreakPoints(content, breakPoints, codeFences, maxChars, overlapChars, windowChars);
 }
 
 /**
  * Chunk a document by actual token count using the LLM tokenizer.
  * More accurate than character-based chunking but requires async.
+ *
+ * When filepath and chunkStrategy are provided, uses AST-aware break points
+ * for supported code files.
  */
 export async function chunkDocumentByTokens(
   content: string,
   maxTokens: number = CHUNK_SIZE_TOKENS,
   overlapTokens: number = CHUNK_OVERLAP_TOKENS,
-  windowTokens: number = CHUNK_WINDOW_TOKENS
+  windowTokens: number = CHUNK_WINDOW_TOKENS,
+  filepath?: string,
+  chunkStrategy: ChunkStrategy = "regex",
+  signal?: AbortSignal
 ): Promise<{ text: string; pos: number; tokens: number }[]> {
   // Use moderate chars/token estimate (prose ~4, code ~2, mixed ~3)
   // If chunks exceed limit, they'll be re-split with actual ratio
@@ -1990,7 +2223,8 @@ export async function chunkDocumentByTokens(
   const windowChars = windowTokens * avgCharsPerToken;
 
   // Chunk in character space with conservative estimate
-  let charChunks = chunkDocument(content, maxChars, overlapChars, windowChars);
+  // Use AST-aware chunking for the first pass when filepath/strategy provided
+  let charChunks = await chunkDocumentAsync(content, maxChars, overlapChars, windowChars, filepath, chunkStrategy);
 
   // When using remote LLM (QMD_EMBED_URL set), skip local GGUF tokenization.
   // Char-based chunking is sufficient — remote models handle variable lengths well.
@@ -2008,6 +2242,9 @@ export async function chunkDocumentByTokens(
   const results: { text: string; pos: number; tokens: number }[] = [];
 
   for (const chunk of charChunks) {
+    // Respect abort signal to avoid runaway tokenization
+    if (signal?.aborted) break;
+
     const tokens = await llm.tokenize(chunk.text);
 
     if (tokens.length <= maxTokens) {
@@ -2021,6 +2258,7 @@ export async function chunkDocumentByTokens(
       const subChunks = chunkDocument(chunk.text, safeMaxChars, Math.floor(overlapChars * actualCharsPerToken / 2), Math.floor(windowChars * actualCharsPerToken / 2));
 
       for (const subChunk of subChunks) {
+        if (signal?.aborted) break;
         const subTokens = await llm.tokenize(subChunk.text);
         results.push({
           text: subChunk.text,
@@ -3641,6 +3879,7 @@ export interface HybridQueryOptions {
   explain?: boolean;        // include backend/RRF/rerank score traces
   intent?: string;          // domain intent hint for disambiguation
   skipRerank?: boolean;     // skip LLM reranking, use only RRF scores
+  chunkStrategy?: ChunkStrategy;
   hooks?: SearchHooks;
 }
 
@@ -3808,8 +4047,9 @@ export async function hybridQuery(
   const intentTerms = intent ? extractIntentTerms(intent) : [];
   const docChunkMap = new Map<string, { chunks: { text: string; pos: number }[]; bestIdx: number }>();
 
+  const chunkStrategy = options?.chunkStrategy;
   for (const cand of candidates) {
-    const chunks = chunkDocument(cand.body);
+    const chunks = await chunkDocumentAsync(cand.body, undefined, undefined, undefined, cand.file, chunkStrategy);
     if (chunks.length === 0) continue;
 
     // Pick chunk with most keyword overlap (fallback: first chunk)
@@ -4049,6 +4289,7 @@ export interface StructuredSearchOptions {
   intent?: string;
   /** Skip LLM reranking, use only RRF scores */
   skipRerank?: boolean;
+  chunkStrategy?: ChunkStrategy;
   hooks?: SearchHooks;
 }
 
@@ -4197,9 +4438,10 @@ export async function structuredSearch(
   const queryTerms = primaryQuery.toLowerCase().split(/\s+/).filter(t => t.length > 2);
   const intentTerms = intent ? extractIntentTerms(intent) : [];
   const docChunkMap = new Map<string, { chunks: { text: string; pos: number }[]; bestIdx: number }>();
+  const ssChunkStrategy = options?.chunkStrategy;
 
   for (const cand of candidates) {
-    const chunks = chunkDocument(cand.body);
+    const chunks = await chunkDocumentAsync(cand.body, undefined, undefined, undefined, cand.file, ssChunkStrategy);
     if (chunks.length === 0) continue;
 
     // Pick chunk with most keyword overlap

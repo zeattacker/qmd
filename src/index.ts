@@ -62,6 +62,7 @@ import {
   type ReindexResult,
   type EmbedProgress,
   type EmbedResult,
+  type ChunkStrategy,
 } from "./store.js";
 import {
   LlamaCpp,
@@ -109,8 +110,9 @@ export type {
 // Re-export the internal Store type for advanced consumers
 export type { InternalStore };
 
-// Re-export utility functions used by frontends
+// Re-export utility functions and types used by frontends
 export { extractSnippet, addLineNumbers, DEFAULT_MULTI_GET_MAX_BYTES };
+export type { ChunkStrategy } from "./store.js";
 
 // Re-export getDefaultDbPath for CLI/MCP that need the default database location
 export { getDefaultDbPath } from "./store.js";
@@ -162,6 +164,8 @@ export interface SearchOptions {
   minScore?: number;
   /** Include explain traces */
   explain?: boolean;
+  /** Chunk strategy: "auto" (default, uses AST for code files) or "regex" (legacy) */
+  chunkStrategy?: ChunkStrategy;
 }
 
 /**
@@ -287,6 +291,9 @@ export interface QMDStore {
   embed(options?: {
     force?: boolean;
     model?: string;
+    maxDocsPerBatch?: number;
+    maxBatchBytes?: number;
+    chunkStrategy?: ChunkStrategy;
     onProgress?: (info: EmbedProgress) => void;
   }): Promise<EmbedResult>;
 
@@ -390,6 +397,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
           explain: opts.explain,
           intent: opts.intent,
           skipRerank,
+          chunkStrategy: opts.chunkStrategy,
         });
       }
 
@@ -401,6 +409,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
         explain: opts.explain,
         intent: opts.intent,
         skipRerank,
+        chunkStrategy: opts.chunkStrategy,
       });
     },
     searchLex: async (q, opts) => internal.searchFTS(q, opts?.limit, opts?.collection),
@@ -503,6 +512,9 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
       return generateEmbeddings(internal, {
         force: embedOpts?.force,
         model: embedOpts?.model,
+        maxDocsPerBatch: embedOpts?.maxDocsPerBatch,
+        maxBatchBytes: embedOpts?.maxBatchBytes,
+        chunkStrategy: embedOpts?.chunkStrategy,
         onProgress: embedOpts?.onProgress,
       });
     },

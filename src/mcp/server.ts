@@ -311,9 +311,12 @@ Intent-aware lex (C++ performance, not sports):
         intent: z.string().optional().describe(
           "Background context to disambiguate the query. Example: query='performance', intent='web page load times and Core Web Vitals'. Does not search on its own."
         ),
+        rerank: z.boolean().optional().default(true).describe(
+          "Rerank results using LLM (default: true). Set to false for faster results on CPU-only machines."
+        ),
       },
     },
-    async ({ query, searches, limit, minScore, candidateLimit, collections, intent }) => {
+    async ({ query, searches, limit, minScore, candidateLimit, collections, intent, rerank }) => {
       // Validate: exactly one of query/searches should be provided
       if (!query && (!searches || searches.length === 0)) {
         return {
@@ -347,6 +350,7 @@ Intent-aware lex (C++ performance, not sports):
           collections: effectiveCollections.length > 0 ? effectiveCollections : undefined,
           limit,
           minScore,
+          rerank,
           intent,
         });
       } else {
@@ -364,6 +368,7 @@ Intent-aware lex (C++ performance, not sports):
           collections: effectiveCollections.length > 0 ? effectiveCollections : undefined,
           limit,
           minScore,
+          rerank,
           intent,
         });
       }
