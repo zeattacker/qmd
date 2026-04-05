@@ -553,11 +553,32 @@ export class LlamaCpp implements LLM {
    */
   private async ensureLlama(): Promise<Llama> {
     if (!this.llama) {
-      const llama = await getLlama({
-        // attempt to build
-        build: "autoAttempt",
-        logLevel: LlamaLogLevel.error
-      });
+      // Allow override via QMD_LLAMA_GPU: "false" | "off" | "none" forces CPU
+      const gpuOverride = (process.env.QMD_LLAMA_GPU ?? "").toLowerCase();
+      const forceCpu = ["false", "off", "none", "disable", "disabled", "0"].includes(gpuOverride);
+
+      const loadLlama = async (gpu: "auto" | false) =>
+        await getLlama({
+          build: "autoAttempt",
+          logLevel: LlamaLogLevel.error,
+          gpu,
+        });
+
+      let llama: Llama;
+      if (forceCpu) {
+        llama = await loadLlama(false);
+      } else {
+        try {
+          llama = await loadLlama("auto");
+        } catch (err) {
+          // GPU backend (e.g. Vulkan on headless/driverless machines) can throw at init.
+          // Fall back to CPU so qmd still works.
+          process.stderr.write(
+            `QMD Warning: GPU init failed (${err instanceof Error ? err.message : String(err)}), falling back to CPU.\n`
+          );
+          llama = await loadLlama(false);
+        }
+      }
 
       if (llama.gpu === false) {
         process.stderr.write(
