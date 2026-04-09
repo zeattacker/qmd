@@ -16,7 +16,7 @@ import {
 } from "node-llama-cpp";
 import { homedir } from "os";
 import { join } from "path";
-import { existsSync, mkdirSync, statSync, unlinkSync, readdirSync, readFileSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, statSync, unlinkSync, readdirSync, readFileSync, writeFileSync, openSync, readSync, closeSync } from "fs";
 
 // =============================================================================
 // Embedding Formatting Functions
@@ -248,6 +248,58 @@ async function getRemoteEtag(ref: HfRef): Promise<string | null> {
   }
 }
 
+const GGUF_MAGIC = Buffer.from("GGUF");
+
+/**
+ * Validate that a file is actually a GGUF model, not an HTML error page
+ * from a proxy, firewall, or failed download.
+ * Throws a descriptive error if the file is not valid GGUF.
+ */
+function validateGgufFile(filePath: string, modelUri: string): void {
+  if (!existsSync(filePath)) return; // let downstream handle missing files
+
+  // Read header + sniff bytes in one go, then close immediately
+  const fd = openSync(filePath, "r");
+  const sniff = Buffer.alloc(512);
+  try {
+    readSync(fd, sniff, 0, 512, 0);
+  } finally {
+    closeSync(fd);
+  }
+
+  const header = sniff.subarray(0, 4);
+  if (header.equals(GGUF_MAGIC)) return; // valid GGUF
+
+  const text = sniff.toString("utf-8").toLowerCase();
+  const isHtml = text.includes("<!doctype") || text.includes("<html");
+  const got = header.toString("utf-8");
+  const sizeKB = (statSync(filePath).size / 1024).toFixed(0);
+
+  // Remove the bad file so the next attempt re-downloads
+  unlinkSync(filePath);
+
+  if (isHtml) {
+    throw new Error(
+      `Downloaded model file is an HTML page, not a GGUF model (${sizeKB} KB).\n` +
+      `Something is intercepting the download from huggingface.co (a proxy, firewall, or captive portal).\n\n` +
+      `Model: ${modelUri}\n` +
+      `Path:  ${filePath}\n\n` +
+      `To fix this, either:\n` +
+      `  1. Try a HuggingFace mirror:  HF_ENDPOINT=https://hf-mirror.com qmd embed\n` +
+      `  2. Download the model manually and set the env var, e.g.:\n` +
+      `       QMD_EMBED_MODEL=/path/to/model.gguf qmd embed\n\n` +
+      `Note: 'qmd search' works without any model downloads.`
+    );
+  }
+
+  throw new Error(
+    `Model file is not valid GGUF (expected magic "GGUF", got "${got}", file is ${sizeKB} KB).\n` +
+    `Model: ${modelUri}\n` +
+    `Path:  ${filePath}\n\n` +
+    `The file has been removed. Run the command again to re-download.`
+  );
+}
+
 export async function pullModels(
   models: string[],
   options: { refresh?: boolean; cacheDir?: string } = {}
@@ -293,6 +345,7 @@ export async function pullModels(
     }
 
     const path = await resolveModelFile(model, cacheDir);
+    validateGgufFile(path, model);
     const sizeBytes = existsSync(path) ? statSync(path).size : 0;
     if (hfRef && filename) {
       const remoteEtag = await getRemoteEtag(hfRef);
@@ -591,12 +644,16 @@ export class LlamaCpp implements LLM {
   }
 
   /**
-   * Resolve a model URI to a local path, downloading if needed
+   * Resolve a model URI to a local path, downloading if needed.
+   * Validates the downloaded file is actually a GGUF model (not an HTML error page
+   * from a proxy or firewall).
    */
   private async resolveModel(modelUri: string): Promise<string> {
     this.ensureModelCacheDir();
     // resolveModelFile handles HF URIs and downloads to the cache dir
-    return await resolveModelFile(modelUri, this.modelCacheDir);
+    const modelPath = await resolveModelFile(modelUri, this.modelCacheDir);
+    validateGgufFile(modelPath, modelUri);
+    return modelPath;
   }
 
   /**
