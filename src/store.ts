@@ -40,7 +40,7 @@ import type {
 // Configuration
 // =============================================================================
 
-const HOME = process.env.HOME || "/tmp";
+const HOME = process.env.HOME || process.env.USERPROFILE || "/tmp";
 export const DEFAULT_EMBED_MODEL = "bge-m3";
 export const DEFAULT_RERANK_MODEL = "ExpedientFalcon/qwen3-reranker:0.6b-q8_0";
 export const DEFAULT_QUERY_MODEL = "Qwen/Qwen3-1.7B";
