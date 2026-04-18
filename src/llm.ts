@@ -443,6 +443,18 @@ export type LlamaCppConfig = {
 const DEFAULT_INACTIVITY_TIMEOUT_MS = 5 * 60 * 1000;
 const DEFAULT_EXPAND_CONTEXT_SIZE = 2048;
 
+type LlamaGpuMode = "auto" | "metal" | "vulkan" | "cuda" | false;
+
+export function resolveLlamaGpuMode(envValue = process.env.QMD_LLAMA_GPU): LlamaGpuMode {
+  const normalized = envValue?.trim().toLowerCase() ?? "";
+  if (!normalized) return "auto";
+  if (["false", "off", "none", "disable", "disabled", "0"].includes(normalized)) return false;
+  if (normalized === "metal" || normalized === "vulkan" || normalized === "cuda") return normalized;
+
+  process.stderr.write(`QMD Warning: invalid QMD_LLAMA_GPU="${envValue}", using auto GPU selection.\n`);
+  return "auto";
+}
+
 function resolveExpandContextSize(configValue?: number): number {
   if (configValue !== undefined) {
     if (!Number.isInteger(configValue) || configValue <= 0) {
@@ -606,11 +618,9 @@ export class LlamaCpp implements LLM {
    */
   private async ensureLlama(): Promise<Llama> {
     if (!this.llama) {
-      // Allow override via QMD_LLAMA_GPU: "false" | "off" | "none" forces CPU
-      const gpuOverride = (process.env.QMD_LLAMA_GPU ?? "").toLowerCase();
-      const forceCpu = ["false", "off", "none", "disable", "disabled", "0"].includes(gpuOverride);
+      const gpuMode = resolveLlamaGpuMode();
 
-      const loadLlama = async (gpu: "auto" | false) =>
+      const loadLlama = async (gpu: LlamaGpuMode) =>
         await getLlama({
           build: "autoAttempt",
           logLevel: LlamaLogLevel.error,
@@ -618,16 +628,16 @@ export class LlamaCpp implements LLM {
         });
 
       let llama: Llama;
-      if (forceCpu) {
+      if (gpuMode === false) {
         llama = await loadLlama(false);
       } else {
         try {
-          llama = await loadLlama("auto");
+          llama = await loadLlama(gpuMode);
         } catch (err) {
           // GPU backend (e.g. Vulkan on headless/driverless machines) can throw at init.
           // Fall back to CPU so qmd still works.
           process.stderr.write(
-            `QMD Warning: GPU init failed (${err instanceof Error ? err.message : String(err)}), falling back to CPU.\n`
+            `QMD Warning: GPU init failed${gpuMode === "auto" ? "" : ` for QMD_LLAMA_GPU=${gpuMode}`} (${err instanceof Error ? err.message : String(err)}), falling back to CPU.\n`
           );
           llama = await loadLlama(false);
         }

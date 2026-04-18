@@ -24,6 +24,8 @@
 - Sync stale `bun.lock` (`better-sqlite3` 11.x → 12.x). CI and release
   script now use `--frozen-lockfile` to prevent recurrence. #386
   (thanks @Mic92)
+- GPU: respect explicit `QMD_LLAMA_GPU=metal|vulkan|cuda` backend overrides
+  instead of always using auto GPU selection. #529 (thanks @erskingardner)
 ## [2.0.1] - 2026-03-10
 
 ### Changes
