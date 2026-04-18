@@ -2246,33 +2246,67 @@ export async function chunkDocumentByTokens(
 
   // Tokenize and split any chunks that still exceed limit
   const results: { text: string; pos: number; tokens: number }[] = [];
+  const clampOverlapChars = (value: number, maxChars: number): number => {
+    if (maxChars <= 1) return 0;
+    return Math.max(0, Math.min(maxChars - 1, Math.floor(value)));
+  };
+
+  const pushChunkWithinTokenLimit = async (text: string, pos: number): Promise<void> => {
+    if (signal?.aborted) return;
+
+    const tokens = await llm.tokenize(text);
+    if (tokens.length <= maxTokens || text.length <= 1) {
+      results.push({ text, pos, tokens: tokens.length });
+      return;
+    }
+
+    const actualCharsPerToken = text.length / tokens.length;
+    let safeMaxChars = Math.floor(maxTokens * actualCharsPerToken * 0.95);
+    if (!Number.isFinite(safeMaxChars) || safeMaxChars < 1) {
+      safeMaxChars = Math.floor(text.length / 2);
+    }
+    safeMaxChars = Math.max(1, Math.min(text.length - 1, safeMaxChars));
+
+    let nextOverlapChars = clampOverlapChars(
+      overlapChars * actualCharsPerToken / 2,
+      safeMaxChars,
+    );
+    let nextWindowChars = Math.max(0, Math.floor(windowChars * actualCharsPerToken / 2));
+    let subChunks = chunkDocument(text, safeMaxChars, nextOverlapChars, nextWindowChars);
+
+    // Pathological single-line blobs can produce no meaningful breakpoint progress.
+    // Fall back to a simple half split so every recursion step strictly shrinks.
+    if (
+      subChunks.length <= 1
+      || subChunks[0]?.text.length === text.length
+    ) {
+      safeMaxChars = Math.max(1, Math.floor(text.length / 2));
+      nextOverlapChars = 0;
+      nextWindowChars = 0;
+      subChunks = chunkDocument(text, safeMaxChars, nextOverlapChars, nextWindowChars);
+    }
+
+    if (
+      subChunks.length <= 1
+      || subChunks[0]?.text.length === text.length
+    ) {
+      const fallbackTokens = tokens.slice(0, Math.max(1, maxTokens));
+      const truncatedText = await llm.detokenize(fallbackTokens);
+      results.push({
+        text: truncatedText,
+        pos,
+        tokens: fallbackTokens.length,
+      });
+      return;
+    }
+
+    for (const subChunk of subChunks) {
+      await pushChunkWithinTokenLimit(text.slice(subChunk.pos, subChunk.pos + subChunk.text.length), pos + subChunk.pos);
+    }
+  };
 
   for (const chunk of charChunks) {
-    // Respect abort signal to avoid runaway tokenization
-    if (signal?.aborted) break;
-
-    const tokens = await llm.tokenize(chunk.text);
-
-    if (tokens.length <= maxTokens) {
-      results.push({ text: chunk.text, pos: chunk.pos, tokens: tokens.length });
-    } else {
-      // Chunk is still too large - split it further
-      // Use actual token count to estimate better char limit
-      const actualCharsPerToken = chunk.text.length / tokens.length;
-      const safeMaxChars = Math.floor(maxTokens * actualCharsPerToken * 0.95); // 5% safety margin
-
-      const subChunks = chunkDocument(chunk.text, safeMaxChars, Math.floor(overlapChars * actualCharsPerToken / 2), Math.floor(windowChars * actualCharsPerToken / 2));
-
-      for (const subChunk of subChunks) {
-        if (signal?.aborted) break;
-        const subTokens = await llm.tokenize(subChunk.text);
-        results.push({
-          text: subChunk.text,
-          pos: chunk.pos + subChunk.pos,
-          tokens: subTokens.length,
-        });
-      }
-    }
+    await pushChunkWithinTokenLimit(chunk.text, chunk.pos);
   }
 
   return results;
