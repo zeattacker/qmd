@@ -711,6 +711,7 @@ export function verifySqliteVecLoaded(db: Database): void {
 }
 
 let _sqliteVecAvailable: boolean | null = null;
+let _sqliteVecUnavailableReason: string | null = null;
 
 const DEFAULT_BUSY_TIMEOUT_MS = 5_000;
 
@@ -751,9 +752,12 @@ function initializeDatabase(db: Database): void {
     loadSqliteVec(db);
     verifySqliteVecLoaded(db);
     _sqliteVecAvailable = true;
-  } catch {
+    _sqliteVecUnavailableReason = null;
+  } catch (err) {
     // sqlite-vec is optional — vector search won't work but FTS is fine
     _sqliteVecAvailable = false;
+    _sqliteVecUnavailableReason = getErrorMessage(err);
+    console.warn(_sqliteVecUnavailableReason);
   }
 
   // Drop legacy tables that are now managed in YAML
@@ -1066,7 +1070,9 @@ export function isSqliteVecAvailable(): boolean {
 
 function ensureVecTableInternal(db: Database, dimensions: number): void {
   if (!_sqliteVecAvailable) {
-    throw new Error("sqlite-vec is not available. Vector operations require a SQLite build with extension loading support.");
+    throw createSqliteVecUnavailableError(
+      _sqliteVecUnavailableReason ?? "vector operations require a SQLite build with extension loading support"
+    );
   }
   const tableInfo = db.prepare(`SELECT sql FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get() as { sql: string } | null;
   if (tableInfo) {
