@@ -53,6 +53,27 @@ export type RemoteLLMConfig = {
 };
 
 // =============================================================================
+// Remote rerank truncation budgets
+// =============================================================================
+// The remote rerank server (llama.cpp ranking backend) has a fixed per-slot
+// context (commonly 2048 tokens) and returns 400 when the full prompt
+// (system+instruct template + query + document) exceeds it. RemoteLLM has no
+// local tokenizer (that is the whole point of remote mode), so we truncate by
+// characters before POSTing. Defaults are sized to keep query+doc+template
+// under a 2048-token slot even for dense (non-English) text at ~3 chars/token:
+//   doc 4000 chars (~1333 tok) + query 400 chars (~133 tok) + template (~120 tok)
+//   ≈ 1586 tokens, well under 2048.
+// Bump these (and the server's n_ctx) if your reranker slot has more room.
+const RERANK_MAX_DOC_CHARS = (() => {
+  const v = parseInt(process.env.QMD_RERANK_MAX_DOC_CHARS ?? "", 10);
+  return Number.isFinite(v) && v > 0 ? v : 4000;
+})();
+const RERANK_MAX_QUERY_CHARS = (() => {
+  const v = parseInt(process.env.QMD_RERANK_MAX_QUERY_CHARS ?? "", 10);
+  return Number.isFinite(v) && v > 0 ? v : 400;
+})();
+
+// =============================================================================
 // RemoteLLM Implementation
 // =============================================================================
 
@@ -235,6 +256,15 @@ export class RemoteLLM implements LLM {
     const neutralResults = (): RerankDocumentResult[] =>
       documents.map((d, i) => ({ file: d.file, score: 0.5, index: i }));
 
+    // Truncate query and each document to fit the remote reranker's context
+    // window. Without a local tokenizer we cap by characters; oversized inputs
+    // otherwise make the ranking backend return 400 (then we lose reranking).
+    const safeQuery =
+      query.length > RERANK_MAX_QUERY_CHARS ? query.slice(0, RERANK_MAX_QUERY_CHARS) : query;
+    const safeDocs = documents.map(d =>
+      d.text.length > RERANK_MAX_DOC_CHARS ? d.text.slice(0, RERANK_MAX_DOC_CHARS) : d.text
+    );
+
     try {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), this.timeoutMs);
@@ -243,8 +273,8 @@ export class RemoteLLM implements LLM {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          query,
-          documents: documents.map(d => d.text),
+          query: safeQuery,
+          documents: safeDocs,
           model: this.rerankModelName_,
         }),
         signal: controller.signal,
