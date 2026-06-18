@@ -841,7 +841,7 @@ export async function startMcpHttpServer(
 
   await new Promise<void>((resolve, reject) => {
     httpServer.on("error", reject);
-    httpServer.listen(port, "localhost", () => resolve());
+    httpServer.listen(port, "127.0.0.1", () => resolve());
   });
 
   const actualPort = (httpServer.address() as import("net").AddressInfo).port;
