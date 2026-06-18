@@ -3386,7 +3386,7 @@ describe("Embedding batching", () => {
       expect(sessionSpy).toHaveBeenCalledWith(
         fakeLlm,
         expect.any(Function),
-        expect.objectContaining({ maxDuration: 30 * 60 * 1000, name: "generateEmbeddings" }),
+        expect.objectContaining({ maxDuration: 4 * 60 * 60 * 1000, name: "generateEmbeddings" }),
       );
     } finally {
       sessionSpy.mockRestore();

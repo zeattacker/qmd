@@ -63,9 +63,7 @@ import {
   type EmbedResult,
   type ChunkStrategy,
 } from "./store.js";
-import {
-  LlamaCpp,
-} from "./llm.js";
+import { createLLM } from "./llm-remote.js";
 import {
   setConfigSource,
   loadConfig,
@@ -368,9 +366,10 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
   }
   // else: DB-only mode — no external config, use existing store_collections
 
-  // Create a per-store LlamaCpp instance — lazy-loads models on first use,
-  // auto-unloads after 5 min inactivity to free VRAM.
-  const llm = new LlamaCpp({
+  // Create the per-store LLM instance — uses remote HTTP endpoints when
+  // QMD_EMBED_URL / QMD_RERANK_URL are set, otherwise local LlamaCpp with GGUF
+  // models. Lazy-loads on first use, auto-unloads after 5 min to free VRAM.
+  const llm = createLLM({
     embedModel: config?.models?.embed,
     generateModel: config?.models?.generate,
     rerankModel: config?.models?.rerank,

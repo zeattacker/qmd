@@ -82,6 +82,7 @@ import {
   type ChunkStrategy,
 } from "../store.js";
 import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive } from "../llm.js";
+import { createLLM, isRemoteLLMConfigured } from "../llm-remote.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -139,6 +140,18 @@ function getStore(): ReturnType<typeof createStore> {
         generateModel: activeModels.generate,
         rerankModel: activeModels.rerank,
       }));
+      // Route embed/rerank to remote HTTP backend when QMD_EMBED_URL /
+      // QMD_RERANK_URL are set (re-applied onto v2.5.3 from fork commit fbe21b5).
+      // Query expansion stays local via the RemoteLLM's internal LlamaCpp.
+      if (isRemoteLLMConfigured()) {
+        store.llm = createLLM({
+          embedModel: activeModels.embed,
+          generateModel: activeModels.generate,
+          rerankModel: activeModels.rerank,
+          inactivityTimeoutMs: 5 * 60 * 1000,
+          disposeModelsOnInactivity: true,
+        });
+      }
     } catch {
       // Config may not exist yet — that's fine, DB works without it
     }
