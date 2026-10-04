@@ -25,6 +25,7 @@ import {
   formatQueryForEmbedding,
   formatDocForEmbedding,
   withLLMSessionForLlm,
+  isRerankDisabled,
   DEFAULT_EMBED_MODEL_URI,
   DEFAULT_RERANK_MODEL_URI,
   DEFAULT_GENERATE_MODEL_URI,
@@ -4569,7 +4570,8 @@ export async function hybridQuery(
   const collection = options?.collection;
   const explain = options?.explain ?? false;
   const intent = options?.intent;
-  const skipRerank = options?.skipRerank ?? false;
+  // QMD_RERANK=off forces the RRF-only path regardless of caller options.
+  const skipRerank = (options?.skipRerank ?? false) || isRerankDisabled();
   const hooks = options?.hooks;
 
   const rankedLists: RankedResult[][] = [];
@@ -4967,7 +4969,7 @@ export async function structuredSearch(
   const candidateLimit = options?.candidateLimit ?? RERANK_CANDIDATE_LIMIT;
   const explain = options?.explain ?? false;
   const intent = options?.intent;
-  const skipRerank = options?.skipRerank ?? false;
+  const skipRerank = (options?.skipRerank ?? false) || isRerankDisabled();
   const hooks = options?.hooks;
 
   const collections = options?.collections;

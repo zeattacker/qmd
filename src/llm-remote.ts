@@ -14,6 +14,8 @@
  *
  * When QMD_EMBED_URL is set, embeddings bypass node-llama-cpp entirely.
  * When QMD_RERANK_URL is set, reranking bypasses node-llama-cpp entirely.
+ * When QMD_RERANK=off, reranking is disabled outright: rerank() throws before
+ * any HTTP call or local GGUF fallback, and the search pipelines never call it.
  * Query expansion (generate) always uses local GGUF via LlamaCpp.
  */
 
@@ -31,7 +33,7 @@ import type {
   Queryable,
 } from "./llm.js";
 
-import { LlamaCpp, type LlamaCppConfig } from "./llm.js";
+import { LlamaCpp, assertRerankEnabled, type LlamaCppConfig } from "./llm.js";
 
 // =============================================================================
 // Configuration
@@ -245,6 +247,8 @@ export class RemoteLLM implements LLM {
     documents: RerankDocument[],
     options: RerankOptions = {}
   ): Promise<RerankResult> {
+    // QMD_RERANK=off: no network call, no local GGUF fallback, no neutral scores.
+    assertRerankEnabled();
     if (!this.rerankUrl) {
       return this.ensureLlamaCpp().rerank(query, documents, options);
     }

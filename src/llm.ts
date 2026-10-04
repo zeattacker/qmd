@@ -284,6 +284,26 @@ export function resolveRerankModel(config?: ModelResolutionConfig): string {
   return config?.rerank || process.env.QMD_RERANK_MODEL || DEFAULT_RERANK_MODEL;
 }
 
+const RERANK_OFF_VALUES = ["off", "false", "0", "no", "none", "disable", "disabled"];
+
+/**
+ * Global rerank kill switch: QMD_RERANK=off (also false/0/no/none/disable/disabled).
+ * When set, every search pipeline skips the rerank stage (identical to
+ * --no-rerank / rerank:false), explicit rerank requests are ignored, and no
+ * reranker — remote or local GGUF — is ever called or loaded. Read on every
+ * call so tests and long-lived processes see the current environment.
+ */
+export function isRerankDisabled(envValue = process.env.QMD_RERANK): boolean {
+  return RERANK_OFF_VALUES.includes(envValue?.trim().toLowerCase() ?? "");
+}
+
+/** Throws if reranking is disabled via QMD_RERANK. Guards every reranker entry point. */
+export function assertRerankEnabled(): void {
+  if (isRerankDisabled()) {
+    throw new Error("Reranking is disabled (QMD_RERANK=off); refusing to call or load a reranker");
+  }
+}
+
 export function resolveModels(config?: ModelResolutionConfig): Required<ModelResolutionConfig> {
   return {
     embed: resolveEmbedModel(config),
@@ -1156,6 +1176,7 @@ export class LlamaCpp implements LLM {
    * Load rerank model (lazy)
    */
   private async ensureRerankModel(): Promise<LlamaModel> {
+    assertRerankEnabled();
     if (this.rerankModel) {
       return this.rerankModel;
     }
@@ -1570,6 +1591,7 @@ export class LlamaCpp implements LLM {
     documents: RerankDocument[],
     options: RerankOptions = {}
   ): Promise<RerankResult> {
+    assertRerankEnabled();
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();

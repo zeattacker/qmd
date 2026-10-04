@@ -3468,7 +3468,7 @@ function showHelp(): void {
   console.log("  --min-score <num>          - Minimum similarity score");
   console.log("  --full                     - Output full document instead of snippet");
   console.log("  -C, --candidate-limit <n>  - Max candidates to rerank (default 40, lower = faster)");
-  console.log("  --no-rerank                - Skip LLM reranking (use RRF scores only, much faster on CPU)");
+  console.log("  --no-rerank                - Skip LLM reranking (use RRF scores only, much faster on CPU; QMD_RERANK=off makes this permanent)");
   console.log("  --no-gpu                   - Force CPU mode for llama.cpp operations (same as QMD_FORCE_CPU=1)");
   console.log("  --line-numbers             - Include line numbers (search; get/multi-get are on by default)");
   console.log("  --no-line-numbers          - Disable line numbers for get/multi-get");
@@ -3614,6 +3614,7 @@ function collectEnvironmentOverrides(activeModels: { embed: string; generate: st
   add("QMD_DOCTOR_DEVICE_PROBE", "controls qmd doctor native device probing; 0/off skips GPU probing");
   add("QMD_EMBED_PARALLELISM", "overrides embedding parallel context count; too high can exhaust RAM/VRAM");
   add("QMD_EXPAND_CONTEXT_SIZE", "overrides query expansion context size; larger values use more memory");
+  add("QMD_RERANK", "off/false/0 disables reranking everywhere (CLI, MCP, SDK): results keep fused RRF order and no reranker is called or loaded");
   add("QMD_RERANK_CONTEXT_SIZE", "overrides reranker context size; larger values use more memory");
   add("QMD_EMBED_CONTEXT_SIZE", "overrides embed context size; larger values use more memory");
   add("QMD_EDITOR_URI", "overrides clickable editor link template in terminal output");

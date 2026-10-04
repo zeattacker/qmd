@@ -31,6 +31,10 @@ import {
 } from "../index.js";
 import { getConfigPath } from "../collections.js";
 import { enableProductionMode } from "../store.js";
+import { isRerankDisabled } from "../llm.js";
+
+const RERANK_DISABLED_NOTICE =
+  "QMD_RERANK=off: reranking disabled; query results keep fused lex+vec (RRF) order and rerank:true is ignored";
 
 // =============================================================================
 // Types for structured content
@@ -176,6 +180,7 @@ async function createMcpServer(store: QMDStore): Promise<McpServer> {
 
   // Pre-fetch default collection names for search tools
   const defaultCollectionNames = await store.getDefaultCollectionNames();
+  const rerankDisabled = isRerankDisabled();
 
   // ---------------------------------------------------------------------------
   // Resource: qmd://{path} - read-only access to documents by path
@@ -311,8 +316,10 @@ Intent-aware lex (C++ performance, not sports):
         intent: z.string().optional().describe(
           "Background context to disambiguate the query. Example: query='performance', intent='web page load times and Core Web Vitals'. Does not search on its own."
         ),
-        rerank: z.boolean().optional().default(true).describe(
-          "Rerank results using LLM (default: true). Set to false for faster results on CPU-only machines."
+        rerank: z.boolean().optional().default(!rerankDisabled).describe(
+          rerankDisabled
+            ? "Ignored: reranking is disabled on this server (QMD_RERANK=off)."
+            : "Rerank results using LLM (default: true). Set to false for faster results on CPU-only machines."
         ),
       },
     },
@@ -332,6 +339,7 @@ Intent-aware lex (C++ performance, not sports):
         limit,
         minScore,
         candidateLimit,
+        // With QMD_RERANK=off the search pipeline forces the RRF-only path even if rerank is true.
         rerank,
         intent,
       });
@@ -569,6 +577,7 @@ export async function startMcpServer(options: McpStartupOptions = {}): Promise<v
   const server = await createMcpServer(store);
   const transport = new StdioServerTransport();
   await server.connect(transport);
+  if (isRerankDisabled()) console.error(RERANK_DISABLED_NOTICE);
 }
 
 // =============================================================================
@@ -875,6 +884,7 @@ export async function startMcpHttpServer(
   });
 
   log(`QMD MCP server listening on http://localhost:${actualPort}/mcp`);
+  if (isRerankDisabled()) log(RERANK_DISABLED_NOTICE);
   return { httpServer, port: actualPort, stop };
 }
 
