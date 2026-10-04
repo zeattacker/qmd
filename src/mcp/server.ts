@@ -841,7 +841,12 @@ export async function startMcpHttpServer(
 
   await new Promise<void>((resolve, reject) => {
     httpServer.on("error", reject);
-    httpServer.listen(port, "127.0.0.1", () => resolve());
+    // Bind address. Defaults to loopback — safe for a local CLI server —
+    // but overridable, because inside a container "127.0.0.1" is the
+    // container's own loopback: a published port maps to nothing and every
+    // connection from the host is reset.
+    const host = process.env.QMD_MCP_HOST || "127.0.0.1";
+    httpServer.listen(port, host, () => resolve());
   });
 
   const actualPort = (httpServer.address() as import("net").AddressInfo).port;
